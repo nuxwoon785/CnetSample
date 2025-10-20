@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
 using System.Drawing;
+using System.Globalization;
 using System.IO.Ports;
 using System.Linq;
 using System.Text;
@@ -206,24 +207,206 @@ namespace CNetTest
             }
         }
 
-        private byte[] BuildSampleFrame()
+        private static string NormalizeStation(string station)
         {
-            var bytes = new List<byte>();
-            bytes.Add(0x05);
-            //00(국번), R(읽기)  SS(명령어타입)  02(몇개) 변수1길이,변수1명 변수2길이,변수2명
-            string payload = "00RSS0206%MW10006%MW101";
-            string payload1 = "00RSB06%MW10010";
-            bytes.AddRange(Encoding.ASCII.GetBytes(payload1));
+            if (string.IsNullOrWhiteSpace(station))
+                throw new ArgumentException("Station cannot be null or empty.", nameof(station));
+
+            station = station.Trim();
+            if (station.Length < 2)
+                station = station.PadLeft(2, '0');
+
+            return station;
+        }
+
+        private static string FormatDecimal(int value, int minimumDigits)
+        {
+            if (value < 0)
+                throw new ArgumentOutOfRangeException(nameof(value), "Value cannot be negative.");
+
+            string text = value.ToString(CultureInfo.InvariantCulture);
+            if (text.Length < minimumDigits)
+            {
+                text = text.PadLeft(minimumDigits, '0');
+            }
+
+            return text;
+        }
+
+        private static byte[] BuildFrameFromAscii(string asciiPayload)
+        {
+            if (asciiPayload == null) throw new ArgumentNullException(nameof(asciiPayload));
+
+            var bytes = new List<byte>(asciiPayload.Length + 3)
+            {
+                0x05
+            };
+
+            bytes.AddRange(Encoding.ASCII.GetBytes(asciiPayload));
             bytes.Add(0x04);
 
-            // compute BCC
             byte bcc = 0x00;
             foreach (var b in bytes)
+            {
                 bcc ^= b;
-            bytes.Add(bcc);
+            }
 
+            bytes.Add(bcc);
             return bytes.ToArray();
         }
+
+        private byte[] SendCommand(string asciiPayload, int timeoutMs)
+        {
+            var frame = BuildFrameFromAscii(asciiPayload);
+            var response = ReadBuffer(frame, timeoutMs);
+            if (response == null)
+                throw new TimeoutException("Timed out waiting for PLC response.");
+
+            return response;
+        }
+
+        private static string ExtractAsciiPayload(byte[] frame)
+        {
+            if (frame == null)
+                return null;
+
+            if (frame.Length < 3 || frame[0] != 0x05)
+                throw new FormatException("Invalid frame format.");
+
+            int eotIndex = Array.IndexOf(frame, (byte)0x04, 1);
+            if (eotIndex < 0)
+                throw new FormatException("EOT not found in frame.");
+
+            if (eotIndex <= 1)
+                return string.Empty;
+
+            return Encoding.ASCII.GetString(frame, 1, eotIndex - 1);
+        }
+
+        private string SendCommandForAscii(string asciiPayload, int timeoutMs)
+        {
+            var response = SendCommand(asciiPayload, timeoutMs);
+            return ExtractAsciiPayload(response);
+        }
+
+        public string ReadDevice(IEnumerable<string> deviceAddresses, string station = "00", int timeoutMs = 2000)
+        {
+            if (deviceAddresses == null) throw new ArgumentNullException(nameof(deviceAddresses));
+
+            var addressList = deviceAddresses.Where(a => !string.IsNullOrWhiteSpace(a)).Select(a => a.Trim()).ToList();
+            if (addressList.Count == 0)
+                throw new ArgumentException("At least one device address must be provided.", nameof(deviceAddresses));
+
+            var builder = new StringBuilder();
+            builder.Append(NormalizeStation(station));
+            builder.Append("RSS");
+            builder.Append(FormatDecimal(addressList.Count, 2));
+
+            foreach (var address in addressList)
+            {
+                builder.Append(FormatDecimal(address.Length, 2));
+                builder.Append(address);
+            }
+
+            return SendCommandForAscii(builder.ToString(), timeoutMs);
+        }
+
+        public string WriteDevice(IEnumerable<KeyValuePair<string, string>> deviceValues, string station = "00", int timeoutMs = 2000)
+        {
+            if (deviceValues == null) throw new ArgumentNullException(nameof(deviceValues));
+
+            var filtered = deviceValues.Where(kvp => !string.IsNullOrWhiteSpace(kvp.Key)).ToList();
+            if (filtered.Count == 0)
+                throw new ArgumentException("At least one device/value pair must be provided.", nameof(deviceValues));
+
+            var builder = new StringBuilder();
+            builder.Append(NormalizeStation(station));
+            builder.Append("WSS");
+            builder.Append(FormatDecimal(filtered.Count, 2));
+
+            foreach (var kvp in filtered)
+            {
+                string address = kvp.Key.Trim();
+                string value = (kvp.Value ?? string.Empty).Trim();
+
+                builder.Append(FormatDecimal(address.Length, 2));
+                builder.Append(address);
+                builder.Append(FormatDecimal(value.Length, 2));
+                builder.Append(value);
+            }
+
+            return SendCommandForAscii(builder.ToString(), timeoutMs);
+        }
+
+        public string WriteDevice(IDictionary<string, ushort> deviceValues, string station = "00", int timeoutMs = 2000, bool uppercaseHex = true)
+        {
+            if (deviceValues == null) throw new ArgumentNullException(nameof(deviceValues));
+
+            var converted = new List<KeyValuePair<string, string>>();
+            foreach (var kvp in deviceValues)
+            {
+                string value = uppercaseHex
+                    ? kvp.Value.ToString("X4", CultureInfo.InvariantCulture)
+                    : kvp.Value.ToString("D", CultureInfo.InvariantCulture);
+                converted.Add(new KeyValuePair<string, string>(kvp.Key, value));
+            }
+
+            return WriteDevice(converted, station, timeoutMs);
+        }
+
+        public string ReadBlock(string startAddress, int wordCount, string station = "00", int timeoutMs = 2000)
+        {
+            if (string.IsNullOrWhiteSpace(startAddress))
+                throw new ArgumentException("Start address cannot be null or empty.", nameof(startAddress));
+
+            if (wordCount <= 0)
+                throw new ArgumentOutOfRangeException(nameof(wordCount), "Word count must be positive.");
+
+            startAddress = startAddress.Trim();
+
+            var builder = new StringBuilder();
+            builder.Append(NormalizeStation(station));
+            builder.Append("RSB");
+            builder.Append(FormatDecimal(startAddress.Length, 2));
+            builder.Append(startAddress);
+            builder.Append(FormatDecimal(wordCount, 2));
+
+            return SendCommandForAscii(builder.ToString(), timeoutMs);
+        }
+
+        public string WriteBlock(string startAddress, IEnumerable<ushort> values, string station = "00", int timeoutMs = 2000)
+        {
+            if (string.IsNullOrWhiteSpace(startAddress))
+                throw new ArgumentException("Start address cannot be null or empty.", nameof(startAddress));
+
+            if (values == null) throw new ArgumentNullException(nameof(values));
+
+            var wordList = values.ToList();
+            if (wordList.Count == 0)
+                throw new ArgumentException("At least one value must be provided.", nameof(values));
+
+            startAddress = startAddress.Trim();
+
+            var dataBuilder = new StringBuilder();
+            foreach (var word in wordList)
+            {
+                dataBuilder.Append(word.ToString("X4", CultureInfo.InvariantCulture));
+            }
+
+            string data = dataBuilder.ToString();
+
+            var builder = new StringBuilder();
+            builder.Append(NormalizeStation(station));
+            builder.Append("WSB");
+            builder.Append(FormatDecimal(startAddress.Length, 2));
+            builder.Append(startAddress);
+            builder.Append(FormatDecimal(wordList.Count, 2));
+            builder.Append(FormatDecimal(data.Length, 4));
+            builder.Append(data);
+
+            return SendCommandForAscii(builder.ToString(), timeoutMs);
+        }
+
         private void Form1_Load(object sender, EventArgs e)
         {
             try
@@ -264,12 +447,8 @@ namespace CNetTest
         {
             try
             {
-                var frame = BuildSampleFrame();
-
-                // Send frame bytes
-                _serial.Write(frame, 0, frame.Length);
-
-
+                string response = ReadBlock("%MW100", 10);
+                MessageBox.Show($"ReadBlock response: {response}", "PLC", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
